@@ -28,12 +28,15 @@ from qgis.core import QgsProject
 from PyQt5.QtWidgets import QAction,QMessageBox,QTableWidgetItem,QApplication,QFileDialog
 from PyQt5.QtCore import QSettings, QTranslator, qVersion, QCoreApplication, Qt,QPoint, QRegExp,QPointF
 from PyQt5.QtGui import QIcon,QRegExpValidator,QPolygonF
+from qgis.core import *
+from qgis.PyQt.QtCore import *
 # Initialize Qt resources from file resources.py
 from .resources import *
 # Import the code for the dialog
 from .drone_path_dialog import DronePathDialog
+from qgis.utils import iface
 import os.path
-import math
+import math, processing, ntpath
 
 class DronePath:
     """QGIS Plugin Implementation."""
@@ -72,8 +75,7 @@ class DronePath:
         self.dlg = None
         self.dlg = DronePathDialog()
         
-        self.dlg.pushButton.clicked.connect(self.CalculateD)
-        self.dlg.pushButton_2.clicked.connect(self.BrowseAOI)
+        
     # noinspection PyMethodMayBeStatic
     def tr(self, message):
         """Get the translation for a string using Qt translation API.
@@ -186,7 +188,7 @@ class DronePath:
                 action)
             self.iface.removeToolBarIcon(action)
 
-    def CalculateD(self):
+    def calD(self):
         if (self.dlg.lineEdit_3.text()=='') and (self.dlg.lineEdit.text()==''):
             msg = QMessageBox()
             msg.setIcon(QMessageBox.Critical)
@@ -194,17 +196,257 @@ class DronePath:
             msg.setText("Please enter Camera Field Parameters and calculate again.")
             msg.setStandardButtons(QMessageBox.Ok )
             return msg.exec_()
-        alt = self.dlg.lineEdit.text()
-        fov = self.dlg.lineEdit_3.text()
-        D = 2*int(alt)*math.tan((float(fov))/2)
+        self.alt = self.dlg.lineEdit.text()
+        fov = self.dlg.lineEdit_3.text() #Enter in degrees 
+        fov = float(fov)*(3.14/180)
+        D = 2*int(self.alt)*math.tan((float(fov))/2)
+        D  = round(D,2)
         self.dlg.lineEdit_4.setText(str(D))
+        r = float(self.dlg.lineEdit_6.text())
+        sideA = float(D)/(1+(r**2))
+        sideA = round(sideA,2)
+        sideB = r*float(sideA)
+        sideB = round(sideB,2)
+        area = round((sideA*sideB),2)
+        gsd = round(math.sqrt(area/(int(self.dlg.lineEdit_9.text())*int(self.dlg.lineEdit_10.text()))),4)
         
+        x = int(self.dlg.lineEdit_2.text())/100
+        
+        self.dist = round(((1-x)*int(self.dlg.lineEdit_10.text())*gsd),3)
+        
+        self.dlg.lineEdit_7.setText(str(sideA))
+        self.dlg.lineEdit_8.setText(str(sideB))
+        self.dlg.lineEdit_11.setText(str(area))
+        self.dlg.lineEdit_12.setText(str(gsd))
+        self.dlg.lineEdit_13.setText(str(self.dist))
+        return sideA,sideB, gsd, self.dist, area, D, fov, self.alt,r
+    def linePathBrowse(self):
+        self.save_dir_name = QFileDialog.getExistingDirectory(self,"Select Save Directory","/")
+        print(self.save_dir_name)
+        self.savePathEdit.setText(self.save_dir_name)
+    
+    def drawALine(self):
+        #self.hide()
+        vectorDraftLyr = QgsVectorLayer('LineString?crs=epsg:4326', #epsg needs to be checked and made common for anywhere in the world
+                                        'Input_Line' , 
+                                        "memory")
+        QgsProject().instance().addMapLayer(vectorDraftLyr)
+        # set layer active 
+        #self.hide()
+        iface.setActiveLayer(vectorDraftLyr)
+        # start edit
+        iface.actionToggleEditing().trigger()
+        # enable tool
+        iface.actionAddFeature().trigger() 
+        #self.show()
+        iface.actionToggleEditing().triggered.connect(self.endDrawLine)
+    
+    def endDrawLine(self):
+        iface.actionToggleEditing().triggered.disconnect(self.endDrawLine)
+        #self.show()
+        vlayer = iface.activeLayer()
+    
+        selection = vlayer.getFeatures()
+        count = vlayer.featureCount()
+        #print("当前选择层有特征数：%d" % count)
+        for feature in selection:
+            geom = feature.geometry()
+            geomSingleType = QgsWkbTypes.isSingleType(geom.wkbType())
+            if geom.type() == QgsWkbTypes.LineGeometry:
+                if geomSingleType:
+                    x = geom.asPolyline()
+                    print("Line: ", x, "length: ", geom.length())
+                    pstr_list = []
+                    for index in range(len(x) - 1):
+                        resStr = "{},{},{},{}".format(x[index].x(),x[index].y()
+                                                    ,x[index+1].x(), x[index+1].y())
+                        pstr_list.append(resStr)
+                    
+                    print(pstr_list)
+                    self.dlg.stEndPoint.setText(';'.join(pstr_list))
+    
+    def selectLineRB_clicked(self):
+        if self.dlg.radioButton.isChecked() == True:
+            self.dlg.stackedWidget.show()
+            self.dlg.stackedWidget.setCurrentIndex(0)
+            layers = [layer for layer in QgsProject.instance().mapLayers().values()]
+            layer_list = []        
+            for layer in layers:
+                layer_list.append(layer.name())
+            self.dlg.comboBox.clear()
+            self.dlg.comboBox.addItems(layer_list)
+    
+    def drawLineRB_clicked(self):
+        if self.dlg.radioButton_2.isChecked() == True:
+            self.dlg.stackedWidget.show()
+            self.dlg.stackedWidget.setCurrentIndex(1)
+        
+    def calculateLine(self):
+        if (self.dlg.comboBox.currentText() == "") and (self.dlg.stEndPoint.text()==""):
+            msg = QMessageBox()
+            msg.setIcon(QMessageBox.Critical)
+            msg.setWindowTitle("Input Line Error")
+            msg.setText("No line drawn or selected.")
+            msg.setStandardButtons(QMessageBox.Ok )
+            return msg.exec_()
+        if self.dlg.radioButton.isChecked() == True:
+            if (self.dlg.comboBox.currentText() != "") and (self.dlg.stEndPoint.text()==""):
+                for layer in QgsProject.instance().mapLayers().values():
+                    if layer.name() == self.dlg.comboBox.currentText():
+                        line = layer
+        elif self.dlg.radioButton_2.isChecked() == True:
+            if (self.dlg.comboBox.currentText() == "") and (self.dlg.stEndPoint.text()!=""):
+                for layer in QgsProject.instance().mapLayers().values():
+                    if layer.name() == 'Input_Line':
+                        line = layer
+        print(line)
+        #sideA, sideB, fov, alt, D,gsd, area, dist, r = calD()
+        if line.crs() != QgsCoordinateReferenceSystem(4326):
+            msg = QMessageBox()
+            msg.setIcon(QMessageBox.Critical)
+            msg.setWindowTitle("Line Error")
+            msg.setText("Change the input line projection to EPSG: 4326 and try again")
+            msg.setStandardButtons(QMessageBox.Ok)
+            return msg.exec_()
+        if line.crs() == QgsCoordinateReferenceSystem(4326):
+            R = 6371000 #earth radius in meters
+            pi = 3.14
+            griddist = (180*self.dist)/(6371000*pi)
+            print(griddist)
+            #outputpath = os.path(self.dlg.output.text())
+            parameters = {'INPUT': line, 'COUNT':int(self.dlg.rightLines.text()), 'OFFSET': griddist, 'OUTPUT': 'memory:parallel_lines'} 
+            plines=processing.run('native:arrayoffsetlines',parameters)
+        plinesLayer = plines['OUTPUT']
+        QgsProject.instance().addMapLayer(plinesLayer)
+        parameters_clip = {'INPUT':plinesLayer, 'OVERLAY':self.aoi_layer, 'OUTPUT':'memory:clipped_lines'}
+        clip_lines=processing.run('native:clip',parameters_clip)
+        clip_linesLayer = clip_lines['OUTPUT']
+        QgsProject.instance().addMapLayer(clip_linesLayer)
+        wayPts = processing.run('native:extractvertices',{'INPUT':clip_linesLayer,'OUTPUT':'memory:way_points'})
+        wayPtsLayerNoGeom = wayPts['OUTPUT']
+        wayPtsGeom = processing.run('qgis:exportaddgeometrycolumns',{'INPUT': wayPtsLayerNoGeom, 'CALC_METHOD':0,'OUTPUT':'memory:Way_Points'})
+        wayPtsGeomLayer = wayPtsGeom['OUTPUT']
+        
+        fields = wayPtsGeomLayer.fields()
+        wayPtsGeomLayer.startEditing()
+        for field in fields:    
+            if (field.name() != 'xcoord') and (field.name() !='ycoord'):
+                print(field.name())
+                wayPtsGeomLayer.deleteAttribute(wayPtsGeomLayer.fields().indexFromName(field.name()))
+        #layer = iface.activeLayer()
+        for field in wayPtsGeomLayer.fields():
+            if field.name() == 'xcoord':
+                idx = wayPtsGeomLayer.fields().indexFromName(field.name())
+                wayPtsGeomLayer.renameAttribute(idx, 'longitude')
+        for field in wayPtsGeomLayer.fields():
+            if field.name() == 'ycoord':
+                idx = wayPtsGeomLayer.fields().indexFromName(field.name())
+                wayPtsGeomLayer.renameAttribute(idx, 'latitude')
+        wayPtsGeomLayer.commitChanges()
+        refactor = processing.run('native:refactorfields',{'INPUT': wayPtsGeomLayer,'FIELDS_MAPPING':[
+        {'expression': '"latitude"','length': 0,'name': 'latitude','precision': 0,'type': 6},
+        {'expression': '"longitude"','length': 0,'name': 'longitude','precision': 0,'type': 6}], 'OUTPUT':'memory:WayPoints'})
+        refactorLayer = refactor['OUTPUT']
+        
+        refactorLayer.dataProvider().addAttributes([QgsField( 'altitude(m)', QVariant.Double,"double",10,2 )])
+        refactorLayer.dataProvider().addAttributes([QgsField( 'heading(deg)', QVariant.Double,"double",10,2 )])
+        refactorLayer.dataProvider().addAttributes([QgsField( 'curvesize(m)', QVariant.Double,"double",10,2 )])
+        refactorLayer.dataProvider().addAttributes([QgsField( 'rotationdir', QVariant.Double,"double",10,2 )])
+        refactorLayer.dataProvider().addAttributes([QgsField( 'gimbalmode', QVariant.Double,"double",10,2 )])
+        refactorLayer.dataProvider().addAttributes([QgsField( 'gimbalpitchangle', QVariant.Double,"double",10,2 )])
+        refactorLayer.dataProvider().addAttributes([QgsField( 'actiontype1', QVariant.Double,"double",10,2 )])
+        refactorLayer.dataProvider().addAttributes([QgsField( 'actionparam1', QVariant.Double,"double",10,2 )])
+        refactorLayer.dataProvider().addAttributes([QgsField( 'actiontype2', QVariant.Double,"double",10,2 )])
+        refactorLayer.dataProvider().addAttributes([QgsField( 'actionparam2', QVariant.Double,"double",10,2 )])
+        refactorLayer.dataProvider().addAttributes([QgsField( 'altitudemode', QVariant.Double,"double",10,2 )])
+        refactorLayer.dataProvider().addAttributes([QgsField( 'speed(m/s)', QVariant.Double,"double",10,2 )])
+        refactorLayer.dataProvider().addAttributes([QgsField( 'poi_latitude', QVariant.Double,"double",10,2 )])
+        refactorLayer.dataProvider().addAttributes([QgsField( 'poi_longitude', QVariant.Double,"double",10,2 )])
+        refactorLayer.dataProvider().addAttributes([QgsField( 'poi_altitude(m)', QVariant.Double,"double",10,2 )])
+        refactorLayer.dataProvider().addAttributes([QgsField( 'poi_altitudemode', QVariant.Double,"double",10,2 )])
+        refactorLayer.dataProvider().addAttributes([QgsField( 'photo_timeinterval', QVariant.Double,"double",10,2 )])
+        refactorLayer.dataProvider().addAttributes([QgsField( 'photo_distinterval', QVariant.Double,"double",10,2 )])
+        refactorLayer.updateFields()
+        refactorLayer.startEditing()
+        
+        for feat in refactorLayer.getFeatures():
+            feat['altitude(m)'] = self.alt
+            feat['heading(deg)'] = 45
+            feat['curvesize(m)']=0.2
+            feat['rotationdir']=0
+            feat['gimbalmode'] = 2
+            feat['actiontype1']= -1
+            feat['gimbalpitchangle']= 0
+            feat['actionparam1']= 0
+            feat['actiontype2']= -1
+            feat['actionparam2']= 0
+            feat['altitudemode'] = 0
+            feat['speed(m/s)'] =0
+            feat['poi_latitude'] =0
+            feat['poi_longitude'] =0
+            feat['poi_altitude(m)'] =0
+            feat['poi_altitudemode'] =0
+            feat['photo_timeinterval'] =-1
+            feat['photo_distinterval'] =-1
+            refactorLayer.updateFeature(feat)
+        refactorLayer.commitChanges()
+        refactorLayer.updateFields()
+        
+        QgsProject.instance().addMapLayer(refactorLayer)
+        QgsVectorFileWriter.writeAsVectorFormat(refactorLayer,
+            self.dlg.output.text(),
+            "utf-8",driverName = "CSV" , layerOptions = ['GEOMETRY=AS_latlng']) #add this to this line if you want XY to be calculated on the 
+            #go = (, layerOptions = ['GEOMETRY=AS_XY']).As we are running addgeometry column tool we are not adding this.
+        
+    def browse_csv(self):
+        final_file = QFileDialog.getSaveFileName(self.dlg, "Save output file ","", '*.csv')
+        self.dlg.output.setText(final_file[0])
     def BrowseAOI(self):
         aoi = QFileDialog.getOpenFileName(self.dlg, "Select AOI file ","", '*.shp')
         self.dlg.lineEdit_5.setText(aoi[0])
         
     def loadAOI(self):
+        msg = QMessageBox()
+        if self.dlg.lineEdit_5.text() == '':
+            msg.setIcon(QMessageBox.Critical)
+            msg.setWindowTitle("Unable to load layer")
+            msg.setText("No shapefile selected to load.")
+            msg.setStandardButtons(QMessageBox.Ok )
+            return msg.exec_()
+        elif self.dlg.lineEdit_5.text() != '':    
+            aoi_name = ntpath.basename(self.dlg.lineEdit_5.text()).split('.')[0]
+            self.aoi_layer = QgsVectorLayer(self.dlg.lineEdit_5.text(),aoi_name,"ogr")
+            #symbol = QgsLineSymbol.createSimple({'color': 'blue'})
+            #pipe_layer.renderer().setSymbol(symbol)
+            if not ((self.aoi_layer).wkbType()== QgsWkbTypes.MultiPolygonZ):
+            #self.iface.messageBar().pushMessage( "Pipe Network shapefile should be of Line Geometry Type only. 
+            #Hence, could not load the layer", level=Qgis.Info)
+                msg.setIcon(QMessageBox.Critical)
+                msg.setWindowTitle("Unable to load layer")
+                msg.setText("AOI shapefile should be of Polygon Geometry Type only.")
+                msg.setStandardButtons(QMessageBox.Ok )
+                return msg.exec_()
+            if ((self.aoi_layer).crs() != QgsCoordinateReferenceSystem(4326)):
+                msg = QMessageBox()
+                msg.setIcon(QMessageBox.Critical)
+                msg.setWindowTitle("Projection Error")
+                msg.setText("Change the polygon projection to EPSG: 4326 and try again.")
+                msg.setStandardButtons(QMessageBox.Ok)
+                return msg.exec_()
+        layers =[]        
+        for layer in QgsProject.instance().mapLayers().values():
+                layers.append(layer.name())
+        if aoi_name in layers:
+            msg = QMessageBox()
+            msg.setIcon(QMessageBox.Information)
+            msg.setWindowTitle("Layer Loaded")
+            msg.setText("Layer already loaded in QGIS instance.")
+            msg.setStandardButtons(QMessageBox.Ok)
+            return msg.exec_()    
+        QgsProject.instance().addMapLayer(self.aoi_layer)
         
+    
+    
     def run(self):
         """Run method that performs all the real work"""
 
@@ -214,21 +456,44 @@ class DronePath:
             self.first_start = False
             self.dlg = DronePathDialog()
             
-        self.dlg.pushButton.clicked.connect(self.CalculateD)
-        self.dlg.pushButton_2.clicked.connect(self.BrowseAOI)   
+        self.dlg.pushButton.clicked.connect(self.calD)
+        self.dlg.pushButton_2.clicked.connect(self.BrowseAOI)  
+        self.dlg.pushButton_4.clicked.connect(self.drawALine)
+        self.dlg.pushButton_3.clicked.connect(self.loadAOI)
         self.dlg.lineEdit_4.setReadOnly(True)
+        self.dlg.lineEdit_7.setReadOnly(True)
+        self.dlg.lineEdit_8.setReadOnly(True)
+        self.dlg.lineEdit_11.setReadOnly(True)
+        self.dlg.lineEdit_12.setReadOnly(True)
+        self.dlg.lineEdit_13.setReadOnly(True)
         self.dlg.lineEdit.clear()
         reg_ex = QRegExp("(\d\d\d\.[0-9]{,2})") #3 digits and 2 decimals
         input_validator = QRegExpValidator(reg_ex)
         self.dlg.lineEdit.setValidator(input_validator)
         self.dlg.lineEdit_3.clear()
-        reg_ex = QRegExp("(\d\.[0-9]{,2})") #two digit with two decimals
+        reg_ex = QRegExp("(\d\d\.[0-9]{,2})") #two digit with two decimals
         input_validator = QRegExpValidator(reg_ex)
         self.dlg.lineEdit_3.setValidator(input_validator)
         self.dlg.lineEdit_2.clear()
         reg_ex = QRegExp("(\d{2})") #two digit with two decimals
         input_validator = QRegExpValidator(reg_ex)
-        self.dlg.lineEdit_2.setValidator(input_validator)   
+        self.dlg.lineEdit_2.setValidator(input_validator)  
+        self.dlg.lineEdit_6.clear()
+        reg_ex = QRegExp("(\d\.[0-9]{,2})") #one digit with two decimals
+        input_validator = QRegExpValidator(reg_ex)
+        self.dlg.lineEdit_6.setValidator(input_validator)
+        self.dlg.lineEdit.setText('80')
+        self.dlg.lineEdit_2.setText('50')
+        self.dlg.lineEdit_3.setText('83')
+        self.dlg.lineEdit_6.setText('1.55')
+        self.dlg.lineEdit_9.setText('3648')
+        self.dlg.lineEdit_10.setText('5672')
+        self.dlg.pushButton_5.clicked.connect(self.calculateLine)
+        self.dlg.pushButton_6.clicked.connect(self.browse_csv)
+        self.dlg.radioButton.clicked.connect(self.selectLineRB_clicked)
+        self.dlg.radioButton_2.clicked.connect(self.drawLineRB_clicked)
+        #self.dlg.comboBox.activated.connect(self.layerlist)
+        self.dlg.stackedWidget.hide()
         # show the dialog
         self.dlg.show()
         # Run the dialog event loop
